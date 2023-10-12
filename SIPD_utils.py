@@ -26,7 +26,6 @@ def get_pdf(scale: GaussianMixture, xlist):
         pdf = pdf + scale.weights_[i]*norm.pdf(xlist, scale.means_[i], np.sqrt(scale.covariances_[i,0]))
     print(np.shape(pdf))
     return pdf
-        
 
 def gen_drift(noise: float, trend: float, length: int):
     drift = np.zeros(length)
@@ -37,10 +36,11 @@ def gen_drift(noise: float, trend: float, length: int):
 def gen_f0(scale: GaussianMixture, drift: np.ndarray):
     ''' Generates artificial data with a given scale and drift trajectory'''
     [pitches, labels] = scale.sample(len(drift))
-    #print(pitches)
+    print(np.shape(pitches))
     #print(drift)
     np.random.shuffle(pitches)
-    return pitches+drift
+    print("sum: ",np.shape(pitches+drift.reshape(-1, 1)))
+    return pitches+drift.reshape(-1, 1)
 
 @dataclass(init=True, repr=True)
 class SIPDParams:
@@ -63,6 +63,7 @@ class SIPD:
 
     def infer_scale(self, f0: np.ndarray):
         ''' Takes a (de-drifted) f0 timeseries and fits distribution with a set of n_peaks Gaussian peaks '''
+        print(np.shape(f0))
         scale = GaussianMixture(n_components=self.params.n_peaks, random_state = 0).fit(f0)
         
         return scale
@@ -90,18 +91,20 @@ class SIPD:
     
     def run(self, f0: np.ndarray):
         
-        drift_now = np.zeros(len(f0)).reshape(-1,1)
+        drift_now = np.zeros(np.shape(f0))
+        print("drift0: ", np.shape(drift_now))
+        print("f0: ", np.shape(f0))
         self.all_drift.append(drift_now)
         scale_now = self.infer_scale(f0-drift_now+drift_now[0])
-        print(scale_now.n_features_in_)
         self.all_scales.append(scale_now)
         self.all_LLscores.append(scale_now.score(f0-drift_now+drift_now[0]))
         
         for i in range(self.params.n_reps):
             drift_now = self.infer_drift(f0, scale_now)
             self.all_drift.append(drift_now)
+            self.all_f0.append(f0-drift_now+drift_now[0])
             scale_now = self.infer_scale( f0-drift_now+drift_now[0])
-            print(scale_now.n_features_in_)
+            
             self.all_scales.append(scale_now)
             self.all_LLscores.append(scale_now.score(f0-drift_now+drift_now[0]))
         
