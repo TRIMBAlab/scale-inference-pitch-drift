@@ -47,8 +47,8 @@ class SIPDParams:
     ''' Configuration for SIPD algorithm - parameters'''
 
     n_reps: int = 7         # number of algorithm reps
-    n_peaks: int = 7         # number of scale degrees
-    drift_rate: float = 0.001 # expected drift rate
+    n_peaks_prior: int = 7         # number of scale degrees
+    drift_rate_prior: float = 0.001 # expected drift rate
     df0 : float = 0.001      # f0 increment used for derivatives
 
 class SIPD:
@@ -64,7 +64,7 @@ class SIPD:
     def infer_scale(self, f0: np.ndarray):
         ''' Takes a (de-drifted) f0 timeseries and fits distribution with a set of n_peaks Gaussian peaks '''
         print(np.shape(f0))
-        scale = GaussianMixture(n_components=self.params.n_peaks, random_state = 0).fit(f0)
+        scale = GaussianMixture(n_components=self.params.n_peaks_prior, random_state = 0).fit(f0)
         
         return scale
 
@@ -86,7 +86,7 @@ class SIPD:
             LL_up = scale.score_samples((dedrifted_sample + self.params.df0).reshape(1, -1))
             LL_down = scale.score_samples((dedrifted_sample - self.params.df0).reshape(1, -1))
             LL_deriv = (LL_up - LL_down)/(2*self.params.df0)
-            drift[i] = drift[i-1] - LL_deriv * self.params.drift_rate
+            drift[i] = drift[i-1] - LL_deriv * self.params.drift_rate_prior
         return drift
     
     def run(self, f0: np.ndarray):
