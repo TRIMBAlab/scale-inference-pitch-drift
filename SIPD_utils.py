@@ -8,6 +8,7 @@ from scipy.stats import norm
 from dataclasses import dataclass, field
 import matplotlib.pyplot as plt
 from scipy.stats import norm
+from scipy.signal import find_peaks
 
 def make_scale(means: np.ndarray, weights: np.ndarray, variances: np.ndarray):
     gmix = GaussianMixture(n_components=len(means), covariance_type='full')
@@ -22,9 +23,9 @@ def get_pdf(scale: GaussianMixture, xlist):
     pdf = np.zeros(np.shape(xlist))
     for i in range(len(scale.means_)):
         #print(np.shape(scale.means_[i]))
-        print(np.shape(scale.weights_[i]*norm.pdf(xlist, scale.means_[i], np.sqrt(scale.covariances_[i,0]))))
+        #print(np.shape(scale.weights_[i]*norm.pdf(xlist, scale.means_[i], np.sqrt(scale.covariances_[i,0]))))
         pdf = pdf + scale.weights_[i]*norm.pdf(xlist, scale.means_[i], np.sqrt(scale.covariances_[i,0]))
-    print(np.shape(pdf))
+    #print(np.shape(pdf))
     return pdf
 
 def gen_drift(noise: float, trend: float, length: int):
@@ -36,7 +37,6 @@ def gen_drift(noise: float, trend: float, length: int):
 def gen_f0(scale: GaussianMixture, drift: np.ndarray):
     ''' Generates artificial data with a given scale and drift trajectory'''
     [pitches, labels] = scale.sample(len(drift))
-    print(np.shape(pitches))
     #print(drift)
     np.random.shuffle(pitches)
     print("sum: ",np.shape(pitches+drift.reshape(-1, 1)))
@@ -61,13 +61,22 @@ class SIPD:
         self.all_drift = []
         self.all_LLscores = []
 
-    def infer_scale(self, f0: np.ndarray):
-        ''' Takes a (de-drifted) f0 timeseries and fits distribution with a set of n_peaks Gaussian peaks '''
-        print(np.shape(f0))
-        scale = GaussianMixture(n_components=self.params.n_peaks_prior, random_state = 0).fit(f0)
+    #def infer_scale(self, f0: np.ndarray):
+        #''' Takes a (de-drifted) f0 timeseries and fits distribution with a set of n_peaks Gaussian peaks '''
+        #scale = GaussianMixture(n_components=self.params.n_peaks_prior, random_state = 0).fit(f0)
+        #return scale
         
+    def infer_scale(self, f0: np.ndarray, fit_peaks=False):
+        ''' Takes a (de-drifted) f0 timeseries and fits distribution with a set of n_peaks Gaussian peaks '''
+        scale = GaussianMixture(n_components=self.params.n_peaks_prior, random_state = 0).fit(f0)
+        if fit_peaks==True:
+            xlist = np.arange(5, 9, .01)
+            pdf = get_pdf(scale, xlist)
+            peaks, _ = find_peaks(pdf)
+            n_peaks_prior = len(peaks)
+            scale = GaussianMixture(n_components=self.params.n_peaks_prior, random_state = 0).fit(f0)
         return scale
-
+        
     def infer_drift(self, f0: np.ndarray, scale: GaussianMixture):
         ''' Takes a f0 timeseries and a set of peaks and infers the drift timeseries '''
         drift_0 = self.infer_drift_fwd(f0, scale, 0)
