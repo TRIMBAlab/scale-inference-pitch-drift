@@ -1,0 +1,528 @@
+---
+title: "Module 2 Write-up"
+author: "Elizabeth Phillips"
+date: "2023-11-18"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## Background
+Music information retrieval is a large computational field whose goal is, broadly speaking, to be able to automatically extract features of interest from audio (most especially music) recordings. These features can vary from low-level features (such as fundamental pitch) to high-level features (such as key). Historically, much of MIR has focused on features which are relevant in Western Classical and Pop music, and are therefore based on twelve-tone equal temperament (12-ET). For example, there are many computational methods for estimating the key of a piece of music, but they commonly rely on pitch-class profiles; these are 12-bin histograms where each bin represents one equal-tempered (or chromatic) tone. The distribution of these tones, most especially which is the most common, can be used to infer the key of the piece. From the key (which comprises a single letter name and the designation of either major or minor), it is assumed that one can infer the scale (which comprises the set of melodic notes), because the relationship between key and scale are fixed by Western music theory.
+
+Of course, there are many cases where these assumptions do not hold true. First of all, there are bound to be chromatic notes in a melody which, by definition, do not conform to the key. Nonetheless, they are typically uncommon, so they don't tend to disturb the pitch-class profile drastically enough to upset key-finding algorithms. But what about cases where 12-ET itself is not the correct basis for estimating high-level features of music? In Indian Classical music, for example, ragas cannot be estimated using pitch-class profiles, because micro-tonal ornaments are crucial to the identity of each raga. In this case, using 12 bins merely enforces a false information paucity, and one rooted in colonialism to boot. One might assume that using a continuous pitch distribution (unconstrained by the Western concept of twelve discrete scale notes) would reveal enough micro-tonal information to classify each raga.
+
+The assumption would be false, as in fact, several ragas have very similar pitch distributions, and the melodic gestures themselves which unfold over time are crucial for proper identification. Nonetheless, using a continuous pitch distribution does the trick for many simpler problems in MIR, especially as one moves away from analyzing Western music.
+
+Here, we will consider the task of estimating the scale (the set of melodic notes) of a vocal recording drawn randomly from a cross-cultural corpus of indigenous song. Given that the voice is capable of producing continuous pitch changes, it is necessary to represent pitch on a very fine-grained scale, rather than to use a pitch-class profile. It is also insufficient to declare the most common pitch as the tonal center and assume the other notes from that, or even to try to fit the entire pitch distribution to our existing models of Western scales, because our knowledge of the scale theories and structures of other cultures (including whether the concept of a scale is relevant at all) is very limited. However, if we could simply decompose the entire pitch distribution into its most-likely constituent pitch zones (the fuzzier relative of tones), we would have a decent estimate of the scale used. 
+
+## Motivation
+Unfortunately, there are other problems that complicate the extraction of high-fidelity scale estimates in vocal music. One major issue is pitch drift, which occurs when the sounded notes gradually become increasingly sharp or flat relative to their initial tuning. Pitch drift is a problem for many instruments -- it is quite common for woodwinds to become sharper as they are played and incrementally warmed up -- but is especially prevalent in the voice, which has no fixed *a priori* tuning at all. Pitch drift is an issue in that it causes the scale estimate to differ at different time points within the same recording, which can create conflicts or inaccuracies when algorithms attempt to provide a single, long-term estimate of the underlying scale.
+
+For example, some of the above algorithms estimate the scale by modelling the underlying Gaussian mixture of the pitch probability curve. In the case of pitch drift, the peaks of the long-range pitch probability curve are considerably less precise than those given by any one short-term (windowed) curve. In extreme cases, the peaks can even be entirely obscured. The resulting unimodal distribution, while technically representative of the long-range pitch probability, doesn't reflect the underlying tonal structure that is obvious to listeners, who can update our internal model of the scale in time with the pitch drift. Therefore, if pitch drift could be accounted for computationally, the peaks of the probability curve would be sharpened and the estimate of the underlying scale would be more precise. This enhanced scale estimation would also be helpful in situations where identifying underlying long-range tonal structures is necessary for some other task (e.g., speech/song classification).
+
+## Methods
+
+The following analysis is performed primarily in Python. So, you will need the Python downloaded to your device, as well as the r package Reticulate to interface with your Python install. We will then import the necessary packages, including the python script "SIPD_utils.py", which contains the functions we will use for this analysis.
+
+```{r reticulate, include=FALSE}
+library(reticulate)
+use_python('C:/Users/emphi/Anaconda3')
+knitr::knit_engines$set(python = reticulate::eng_python)
+```
+
+```{r utilities, include=FALSE}
+SIPD_utils <- source_python("./SIPD_utils.py")
+```
+
+```{python libraries, include=FALSE}
+#Import libraries
+import csv
+import importlib
+#import SIPD_utils
+#importlib.reload(SIPD_utils)
+import numpy as np
+import matplotlib.pyplot as plt
+import matplotlib.image as mpimg
+from scipy.signal import find_peaks
+```
+
+
+### Testing on simulated data
+
+First, we want to simulate some pitch data with a given trajectory of pitch drift. This doesn't have to resemble actual singing; as long as we know the values of our simulation, we will be able to evaluate the performance of our analysis.
+
+```{python simulate-data, results=FALSE}
+#Set the parameters of your simulated f0 trace
+means = np.array([1,2, 2.5, 3.5, 4])
+weights = np.array([.3, .1, .1, .2, .3])
+variances = np.array([.03, .03, .03, .03, .03])
+xlist = np.arange(0, 5, .01)
+
+#Create your simulated non-drifting f0 trace
+true_scale = make_scale(means.reshape(-1,1), weights, variances.reshape((5,1,1)))
+true_pdf = get_pdf(true_scale, xlist.reshape(-1, 1))
+
+#Create your simulated drift trajectory
+true_drift = gen_drift(noise=.02, trend=0, length=1000)
+
+#Create your simulated drifting f0 trace
+f0=gen_f0(true_scale, true_drift)
+```
+```{python simulate-data-fig, cache=TRUE}
+#Plot the drift trajectory
+plt.plot(true_drift)
+plt.show()
+```
+
+Now, we want to see if the algorithm is correctly able to infer both the drift and, subsequently, the original non-drifting f0 and scale.
+
+```{python infer-simulation, results=FALSE}
+#Provide some priors for the inference
+p=SIPDParams()
+p.n_peaks_prior = 7
+p.n_reps =4
+p.drift_rate_prior = .002
+m = SIPD(p)
+
+#Infer the scale
+inferred_scale = m.infer_scale(f0)
+inferred_scale.means_
+
+#Infer the drift trajectory
+inferred_drift = m.infer_drift(f0, inferred_scale)
+
+m.run(f0)
+
+#Infer the scale; get both first and last inference
+pdf_0 = get_pdf(m.all_scales[0], xlist.reshape(-1, 1))
+pdf_end = get_pdf(m.all_scales[-1], xlist.reshape(-1, 1))
+
+```
+
+We can test how well the algorithm is performing by plotting the original and final estimates of the scale and drift against their simulated ground truth.
+
+```{python simulation-graphs}
+fig = plt.figure()
+
+plt.subplot(1, 2, 1)
+plt.plot(xlist, pdf_0 )
+plt.plot(xlist, pdf_end )
+plt.plot(xlist, true_pdf )
+plt.legend(['initial PDF', 'final PDF', 'true PDF'])
+
+plt.subplot(1, 2, 2)
+plt.plot(m.all_drift[1])
+plt.plot(m.all_drift[4])
+plt.plot(true_drift)
+plt.legend(["drift estimate 1", "drift estimate 4", "true drift"])
+
+plt.show()
+```
+
+As we can see, the final estimates for both the scale and the drift are markedly better than the initial estimates, and have converged on solutions very close to the ground truths. There is still some error: the scale estimator is overestimating the probability at the fourth "scale degree" at 3.5, and lacks precision for its estimate of the second scale degree at 2; the overall trajectory of the drift has been found, but the exact pattern of its noise is not being reproduced. Nonetheless, these simulations show proof-of-concept for the algorithm's functionality, and the real test of its functionality is using real data.
+
+## Application to real data
+
+### Materials
+
+To test the algorithm, we collected a small corpus of indigenous solo vocal music where pitch drift had been identified by ear. In fact, the pitch drift in these pieces had caused them to be excluded from another project which aimed to estimate vocal scales using GMMs -- thus, they were the perfect testing grounds for this project. 
+
+These recordings can be found in the "samples" folder. "Audio" contains the audio files of the samples; "Annotations" contains their f0 traces as produced using the pYIN algorithm, with manual corrections in Tony.
+
+### Parameter tuning
+First, we had to explore parameter tuning. In the simulated examples, we were able to provide exact priors, but in naturalistic samples, an estimate has to suffice. 
+
+
+#### Number of repetitions
+This is the most straightforward of the parameters. Generally, to pick a reasonable number of repetitions, one must just consider the ideal run time and computing power of their device. Running too many repetitions, however, could lead to over-fitting. For these songs, we found that as few as 4 repetitions could suffice for simpler songs, and as many as 10 were necessary for more difficult songs. An out-of-the-box prior of 12 seemed to work well in most cases.
+
+#### Drift rate
+To pick a reasonable drift rate prior, one must consider the limitations of the instrument producing the drift. In this case, that instrument was the human voice. While the voice is capable of very rapid continuous pitch change, in most cases, a singer is attempting to follow a melody, and pitch memory serves to anchor them to roughly the same pitches they just sang, with only small pitch errors accruing over long periods of time. So, important considerations are the *length* of the piece and the pitch *stability* of the singer. 
+
+For these songs, long pieces with average drift were well represented with a drift rate prior of $1^{-6}$. For long pieces with considerable drift, or shorter pieces with faster drift, a drift rate prior of $1^{-5}$ was more appropriate. 
+
+The figure below demonstrates this with a longer song, *Whale Song*, with a duration of roughly 2 minutes. We can see that using a faster drift rate ($d=10^{-5}$, left) results in a noisier estimate of the drift trajectory, whereas using a slower drift rate ($d=10^{-6}$, right) results in a smoother estimate that still retains major structural information. For example, drift accelerates after periods of silence between sections of the song, near 40 and 75 seconds, but otherwise rises at a fairly stead rate until about 90 seconds, where it starts to descend. (Nonetheless, the other parameters in this example could probably be tweaked; ideally, the final drift estimate should start near 0, and if not it may indicate a failure to converge fully.)
+
+```{python drift-rate-fig, echo=FALSE, message=FALSE, results='hide', fig.keep='all', cache=TRUE}
+fig = plt.figure(figsize=(18,12), dpi=200, tight_layout=True)
+
+plt.subplot(1, 2, 1)
+image = mpimg.imread("./figs/Kwaikiutl 2-08 A8_ Whale Song p4 r12 d1e-05 drift est.png")
+plt.axis('off')
+plt.imshow(image)
+
+plt.subplot(1, 2, 2)
+image = mpimg.imread("./figs/Kwaikiutl 2-08 A8_ Whale Song p4 r12 d1e-06 drift est.png")
+plt.axis('off')
+plt.imshow(image)
+
+plt.show()
+
+```
+
+#### Number of peaks
+To pick a reasonable prior for the number of peaks, one should consider how many notes they *think* are in the song, and then add a few for a good measure. If the number of peaks is underestimated, the algorithm cannot overcome that prior to find a more complex solution, and it will produce a scale estimate comprising a few imprecise peaks. On the other hand, if the number of peaks is overestimated, the algorithm can overcome that prior to converge on a solution with fewer peaks. There is a limit to this rule of thumb; if the number of peaks is grossly overestimated, that prior may also be difficult to overcome, leading to an overly peaky solution. 
+
+In general, for these pieces, we found 12 to be a good out-of-the-box prior. However, this number can (and should) be tuned appropriately given expectations from listening. 
+
+We can demonstrate this using Whale Song again. According to our listening, there should be 5 peaks in this piece. If given a prior of 3 peaks (upper left), the estimate is quite bad. The estimate when given the true value of 5 (upper right) is better, though not very precise. The estimate when given an inflated prior of 10 (lower left) is better still; although it still arrives at a 4-peak solution, there is greater separation between the middle two peaks and some uncertainty around the peak at 7.5, which listening indicates may actually be two adjacent notes. But, the estimate when given a grossly overestimated prior of 20 (lower right) is too peaky in all the wrong places, and still fails to further segregate the peak at 7.5.
+
+```{python peak-num-fig, echo=FALSE, cache=TRUE, message=FALSE, results='hide', fig.keep='all'}
+fig = plt.figure(figsize=(18,12), dpi=200, tight_layout=True)
+
+plt.subplot(2, 2, 1)
+image = mpimg.imread("./figs/Kwaikiutl 2-08 A8_ Whale Song p3 r12 d1e-06 scale est.png")
+plt.axis('off')
+plt.imshow(image)
+
+plt.subplot(2, 2, 2)
+image = mpimg.imread("./figs/Kwaikiutl 2-08 A8_ Whale Song p5 r12 d1e-06 scale est.png")
+plt.axis('off')
+plt.imshow(image)
+
+plt.subplot(2, 2, 3)
+image = mpimg.imread("./figs/Kwaikiutl 2-08 A8_ Whale Song p10 r12 d1e-06 scale est.png")
+plt.axis('off')
+plt.imshow(image)
+
+plt.subplot(2, 2, 4)
+image = mpimg.imread("./figs/Kwaikiutl 2-08 A8_ Whale Song p20 r12 d1e-06 scale est.png")
+plt.axis('off')
+plt.imshow(image)
+
+plt.show()
+```
+
+### Example usage
+
+Having provided examples of how to tune the parameters, we will walk through a full case study using a particularly tricky Khanty song. To begin our analysis, we must load in the data. 
+
+```{python load-data}
+#Load the data
+f0 = []
+t_list = []
+csvfile= open('./samples/Annotations/'+'Khanty 07 Track 07 (1).csv', newline='')
+spamreader = csv.reader(csvfile, delimiter=' ', quotechar='|')
+for row in spamreader:
+  if row[0].split(',')[1] != '0':
+    t_list.append(row[0].split(',')[0])
+    f0.append(row[0].split(',')[1])
+f0=f0[0::1]
+#convert Hz to cents
+f0 = np.array([np.log2(float(i)) for i in f0]).reshape(-1,1)
+t_list = t_list[0::1]
+t_list = np.array([float(i) for i in t_list])
+len(f0)
+```
+
+This piece is several minutes long, so we'll start by assuming the slower drift rate and our out-of-the-box priors of 12 peaks and 12 repetitions. 
+
+```{python melograph, cache=TRUE}
+#Visualize the melody
+plt.figure(figsize=(6,4))
+plt.plot(t_list, f0, "b.")
+```
+
+We can see from the f0 trace that actually, the drift in this piece is significant, so we might have to model it with a faster rate than we normally would for such a long piece. But let's look at how the estimates with the usual prior turn out.
+
+```{python set-priors, cache=TRUE}
+#Set the priors
+p=SIPDParams()
+p.n_peaks_prior = 12
+#best to overestimate rather than underestimate, though of course a gross overestimate will lead to a noisy signal
+p.n_reps = 12 
+#this can vary; 12 is on the upper end necessary
+p.drift_rate_prior = 0.000001
+#0.00001 is best for very short pieces
+#0.000001 is best for longer pieces (unless they drift steadily and a lot)
+m = SIPD(p)
+
+#Infer the scale and drift given the model parameters
+inferred_scale = m.infer_scale(f0)
+inferred_drift = m.infer_drift(f0, inferred_scale)
+
+m.run(f0)
+```
+
+As expected, this result is not very satisfactory. There algorithm doesn't seem to be converging on a real solution; the first and last repetitions are very similar for all three outputs, and they're not capturing or correcting for the obvious upward linear drift of the melody. So let's try it with a faster drift rate.
+
+```{python re-analyze, message=FALSE, results='hide', fig.keep='all', cache=TRUE}
+#Set the priors
+p=SIPDParams()
+p.n_peaks_prior = 12
+p.n_reps = 12 
+p.drift_rate_prior = 0.00001
+m = SIPD(p)
+
+#Infer the scale and drift given the model parameters
+inferred_scale = m.infer_scale(f0)
+inferred_drift = m.infer_drift(f0, inferred_scale)
+
+m.run(f0)
+
+xlist = np.arange(5,9,0.01)
+
+#Get the first and last scale estimates
+pdf_0 = get_pdf(m.all_scales[0], xlist) #.reshape(-1, 1)
+pdf_end = get_pdf(m.all_scales[-1], xlist) #.reshape(-1, 1)
+
+#Get the first and last peak estimates
+peaks_0, _ = find_peaks(pdf_0)
+peaks_end, _ = find_peaks(pdf_end)
+
+#Plot the results
+plt.figure(figsize=(18,12), dpi=200, tight_layout=True)
+
+plt.subplot(2,2,1)
+plt.plot(xlist, pdf_0 )
+plt.plot(xlist, pdf_end )
+plt.plot(xlist[peaks_0], pdf_0[peaks_0], ".b")
+plt.plot(xlist[peaks_end], pdf_end[peaks_end], "rx")
+plt.title('Khanty 07 Track 07')
+plt.legend(['initial PDF', 'final PDF'])
+
+plt.subplot(2,2,2)
+plt.plot(t_list, m.all_drift[1])
+plt.plot(t_list, m.all_drift[4])
+plt.title('Khanty 07 Track 07')
+plt.legend(["drift estimate 1", "drift estimate "+str(p.n_reps), "true drift"])
+
+plt.subplot(2,2,3)
+plt.plot(t_list, m.all_f0[0], ".")
+plt.plot(t_list, m.all_f0[3], ".")
+plt.legend(['original melograph', 'de-drifted melograph'])
+plt.title('Khanty 07 Track 07')
+plt.savefig('./figs/Khanty 07 Track 07 p'+str(p.n_peaks_prior)+' r'+str(p.n_reps)+' d'+str(p.drift_rate_prior)+" de-drift mel.png")
+
+plt.show()
+```
+
+Now we can see that the linear upward drift is being captured and accounted for, and the final scale solution has 4 major peaks. When listening, this piece has approximately 7 notes; however, that is likely just because the drift is so significant over the course of the melody. After correcting for that drift, it is clear that the same short melody is repeated for several minutes, gradually growing sharper, but in fact comprises just 4 main notes (and a long tail of continuous pitches falling off those notes). To demonstrate this fact, see the figure below, which has broken the analysis down into the first (left) and last (right) 30 seconds of the song:
+
+```{python beg-end, cache=TRUE, message=FALSE, results='hide', fig.keep='all'}
+#Set the priors
+p=SIPDParams()
+p.n_peaks_prior = 8
+p.n_reps = 12 
+p.drift_rate_prior = 0.00001
+m = SIPD(p)
+
+f0_start = f0[0:5000]
+#Infer the scale and drift given the model parameters
+inferred_scale = m.infer_scale(f0_start)
+inferred_drift = m.infer_drift(f0_start, inferred_scale)
+
+m.run(f0_start)
+
+xlist = np.arange(5, 9, .01)
+
+#Get the first and last scale estimates
+pdf_0 = get_pdf(m.all_scales[0], xlist) #.reshape(-1, 1)
+pdf_end = get_pdf(m.all_scales[-1], xlist) #.reshape(-1, 1)
+
+#Get the first and last peak estimates
+peaks_0, _ = find_peaks(pdf_0)
+peaks_end, _ = find_peaks(pdf_end)
+
+#Plot the results
+plt.figure(figsize=(18,12), dpi=200, tight_layout=True)
+
+plt.subplot(2,2,1)
+plt.plot(xlist, pdf_0 )
+plt.plot(xlist, pdf_end )
+plt.plot(xlist[peaks_0], pdf_0[peaks_0], ".b")
+plt.plot(xlist[peaks_end], pdf_end[peaks_end], "rx")
+plt.title("Khanty 07 Track 07 - First 30s")
+plt.legend(['initial PDF', 'final PDF'])
+
+plt.subplot(2,2,3)
+plt.plot(t_list[:5000], f0_start, ".")
+
+f0_end = f0[-5000:]
+#Infer the scale and drift given the model parameters
+inferred_scale = m.infer_scale(f0_end)
+inferred_drift = m.infer_drift(f0_end, inferred_scale)
+
+m.run(f0_end)
+
+#Get the first and last scale estimates
+pdf_0 = get_pdf(m.all_scales[0], xlist) #.reshape(-1, 1)
+pdf_end = get_pdf(m.all_scales[-1], xlist) #.reshape(-1, 1)
+
+#Get the first and last peak estimates
+peaks_0, _ = find_peaks(pdf_0)
+peaks_end, _ = find_peaks(pdf_end)
+
+plt.subplot(2,2,2)
+plt.plot(xlist, pdf_0 )
+plt.plot(xlist, pdf_end )
+plt.plot(xlist[peaks_0], pdf_0[peaks_0], ".b")
+plt.plot(xlist[peaks_end], pdf_end[peaks_end], "rx")
+plt.title("Khanty 07 Track 07 - Last 30s")
+plt.legend(['initial PDF', 'final PDF'])
+
+plt.subplot(2,2,4)
+plt.plot(t_list[-5000:], f0_end, ".")
+
+plt.show()
+```
+
+This Khanty song is an ideal use case for this algorithm; we were able to resolve what initially appeared as a blurred, roughly unimodal Gaussian mixture into more distinct, sensible peaks, especially clarifying the two lower peaks at 7.75 and 8, and to remove the clear upward pitch drift to visualize the underlying structure of the repeating melody.
+
+There are several other samples with which to test this algorithm in the 'samples' folder; for those more inclined to survey results, the 'figs' folder shows the results of applying this algorithm to those samples with various parameter settings. 
+
+In particular, there are some speech samples that serve as good examples of where this method "fails." In fact, they are just scenarios where its application would be insensible. The aim of this algorithm is to *find long-scale tonal structure in pieces where it would otherwise be obscured*. If, after trying various priors and breaking down the sample into shorter sections for deeper analysis, no consistent pitch drift can be found nor removed to reveal consistent tonal structure, it is likely that neither actually exists in the sample. To demonstrate this, see the speech sample below, given priors of 3 (left), 5 (middle) or 7 (right) peaks. Clearly, making sense of these results would be extremely difficult.
+
+```{python speech, cache=TRUE, message=FALSE, results='hide', fig.keep='all'}
+#Load the data
+f0 = []
+t_list = []
+with open('./samples/Annotations/'+'30 second monologue_annotations.csv', newline='') as csvfile:
+    spamreader = csv.reader(csvfile, delimiter=' ', quotechar='|')
+    for row in spamreader:
+        if row[0].split(',')[1] != '0':
+            t_list.append(row[0].split(',')[0])
+            f0.append(row[0].split(',')[1])
+f0=f0[0::1]
+f0 = np.array([np.log2(float(i)) for i in f0]).reshape(-1,1)
+t_list = t_list[0::1]
+t_list = np.array([float(i) for i in t_list])
+
+
+#Set the priors
+p=SIPDParams()
+p.n_peaks_prior = 3
+p.n_reps = 12 
+p.drift_rate_prior = 0.00001
+m = SIPD(p)
+
+#Infer the scale and drift given the model parameters
+inferred_scale = m.infer_scale(f0)
+inferred_drift = m.infer_drift(f0, inferred_scale)
+
+m.run(f0)
+
+xlist = np.arange(5, 9, .01)
+
+#Get the first and last scale estimates
+pdf_0 = get_pdf(m.all_scales[0], xlist) #.reshape(-1, 1)
+pdf_end = get_pdf(m.all_scales[-1], xlist) #.reshape(-1, 1)
+
+#Get the first and last peak estimates
+peaks_0, _ = find_peaks(pdf_0)
+peaks_end, _ = find_peaks(pdf_end)
+
+#Plot the results
+plt.figure(figsize=(18,12), dpi=200, tight_layout=True)
+
+plt.subplot(3,3,1)
+plt.plot(xlist, pdf_0 )
+plt.plot(xlist, pdf_end )
+plt.plot(xlist[peaks_0], pdf_0[peaks_0], ".b")
+plt.plot(xlist[peaks_end], pdf_end[peaks_end], "rx")
+plt.title("30 second monologue - 3 peak prior")
+plt.legend(['initial PDF', 'final PDF'])
+
+plt.subplot(3,3,4)
+plt.plot(t_list, m.all_drift[1])
+plt.plot(t_list, m.all_drift[4])
+plt.title("30 second monologue - 5 peak prior")
+plt.legend(["drift estimate 1", "drift estimate "+str(p.n_reps), "true drift"])
+
+plt.subplot(3,3,7)
+plt.plot(t_list, m.all_f0[0], ".")
+plt.plot(t_list, m.all_f0[3], ".")
+plt.title("30 second monologue - 7 peak prior")
+plt.legend(['original melograph', 'de-drifted melograph'])
+plt.savefig('./figs/30 second monologue p'+str(p.n_peaks_prior)+' r'+str(p.n_reps)+' d'+str(p.drift_rate_prior)+" de-drift mel.png")
+
+
+#Set the priors
+p.n_peaks_prior = 5
+m = SIPD(p)
+
+#Infer the scale and drift given the model parameters
+inferred_scale = m.infer_scale(f0)
+inferred_drift = m.infer_drift(f0, inferred_scale)
+
+m.run(f0)
+
+#Get the first and last scale estimates
+pdf_0 = get_pdf(m.all_scales[0], xlist) #.reshape(-1, 1)
+pdf_end = get_pdf(m.all_scales[-1], xlist) #.reshape(-1, 1)
+
+#Get the first and last peak estimates
+peaks_0, _ = find_peaks(pdf_0)
+peaks_end, _ = find_peaks(pdf_end)
+
+plt.subplot(3,3,2)
+plt.plot(xlist, pdf_0 )
+plt.plot(xlist, pdf_end )
+plt.plot(xlist[peaks_0], pdf_0[peaks_0], ".b")
+plt.plot(xlist[peaks_end], pdf_end[peaks_end], "rx")
+plt.legend(['initial PDF', 'final PDF'])
+
+plt.subplot(3,3,5)
+plt.plot(t_list, m.all_drift[1])
+plt.plot(t_list, m.all_drift[4])
+plt.legend(["drift estimate 1", "drift estimate "+str(p.n_reps), "true drift"])
+
+plt.subplot(3,3,8)
+plt.plot(t_list, m.all_f0[0], ".")
+plt.plot(t_list, m.all_f0[3], ".")
+plt.legend(['original melograph', 'de-drifted melograph'])
+plt.savefig('./figs/30 second monologue p'+str(p.n_peaks_prior)+' r'+str(p.n_reps)+' d'+str(p.drift_rate_prior)+" de-drift mel.png")
+
+
+#Set the priors
+p.n_peaks_prior = 7
+m = SIPD(p)
+
+#Infer the scale and drift given the model parameters
+inferred_scale = m.infer_scale(f0)
+inferred_drift = m.infer_drift(f0, inferred_scale)
+
+m.run(f0)
+
+#Get the first and last scale estimates
+pdf_0 = get_pdf(m.all_scales[0], xlist) #.reshape(-1, 1)
+pdf_end = get_pdf(m.all_scales[-1], xlist) #.reshape(-1, 1)
+
+#Get the first and last peak estimates
+peaks_0, _ = find_peaks(pdf_0)
+peaks_end, _ = find_peaks(pdf_end)
+
+plt.subplot(3,3,3)
+plt.plot(xlist, pdf_0 )
+plt.plot(xlist, pdf_end )
+plt.plot(xlist[peaks_0], pdf_0[peaks_0], ".b")
+plt.plot(xlist[peaks_end], pdf_end[peaks_end], "rx")
+plt.legend(['initial PDF', 'final PDF'])
+
+plt.subplot(3,3,6)
+plt.plot(t_list, m.all_drift[1])
+plt.plot(t_list, m.all_drift[4])
+plt.legend(["drift estimate 1", "drift estimate "+str(p.n_reps), "true drift"])
+
+plt.subplot(3,3,9)
+plt.plot(t_list, m.all_f0[0], ".")
+plt.plot(t_list, m.all_f0[3], ".")
+plt.legend(['original melograph', 'de-drifted melograph'])
+plt.savefig('./figs/30 second monologue p'+str(p.n_peaks_prior)+' r'+str(p.n_reps)+' d'+str(p.drift_rate_prior)+" de-drift mel.png")
+
+plt.show()
+```
+
+# Future Directions
+
+The most obvious limitation of the current algorithm is that it is not very "automatic," in that it would be difficult to apply it in batch to a whole folder of samples. One still must listen to each piece and adjust the priors based on their reasonable expectations of pitch drift and the underlying scale structure. There are a few potential solutions to this issue, though they all come with the trade-off that increased automaticity doesn't necessarily stay truthful to the human ear. 
+
+The most finicky prior is the number of peaks. One solution is to run the infer_scale function using an out-of-the-box prior (like 12), but set the `fit_peaks=True`. In this case, the scale will first be inferred using the prior, then the number of peaks in the solution will be found, and the scale will be re-inferred using the number of peaks as an updated prior.  
+
+However, as we've seen, using the actual number of expected peaks as a prior often causes the algorithm to produce a solution with even fewer peaks. Thus it may be better to utilize a drop-one strategy, gradually reducing the number of peaks until the desired solution is found. The difficulty in implementing this method is deciding the evaluation metric used to determine the desired solution. Of course using the BIC of the Gaussian Mixture is the straightforward answer to determining the computationally optimal solution, but will that optimal solution always be the correct solution according to human listening? One might also question the correctness of any one human's listening, so perhaps defaulting to the BIC is not cause for much concern. In any case, testing such an implementation would be a fruitful next step in this work. 
+
+With more data, it would be possible to tune these priors with a Bayesian approach, which may be the most ideal next step. 
+
